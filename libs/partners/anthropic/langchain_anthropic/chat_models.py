@@ -326,6 +326,31 @@ def _normalize_block_tool_use_id(block: dict) -> dict:
     return block
 
 
+def _partition_tool_result_blocks(blocks: list[Any]) -> list[Any]:
+    """Place `tool_result` blocks before other content blocks.
+
+    Anthropic's Messages API requires `tool_result` blocks to appear at the
+    start of a `user` turn's `content` list, preceding any `text` or media
+    blocks. Relative order within each group is preserved.
+
+    Args:
+        blocks: Content blocks for a single `user` turn.
+
+    Returns:
+        A block list with all `tool_result` blocks ordered first.
+    """
+    tool_results: list[Any] = []
+    other_blocks: list[Any] = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            tool_results.append(block)
+        else:
+            other_blocks.append(block)
+    if not tool_results or not other_blocks:
+        return blocks
+    return tool_results + other_blocks
+
+
 def _merge_messages(
     messages: Sequence[BaseMessage],
 ) -> list[SystemMessage | AIMessage | HumanMessage]:
@@ -384,6 +409,8 @@ def _merge_messages(
                 new_content.append({"type": "text", "text": curr.content})
             else:
                 new_content.extend(curr.content)
+            if isinstance(curr, HumanMessage):
+                new_content = _partition_tool_result_blocks(new_content)
             merged[-1] = curr.model_copy(update={"content": new_content})
         else:
             merged.append(curr)
@@ -1073,6 +1100,8 @@ def _format_messages(
                     toolset_name := toolsets.get(block.get("tool_use_id", ""))
                 ):
                     block.setdefault("toolset_name", toolset_name)
+        if role == "user" and isinstance(content, list):
+            content = _partition_tool_result_blocks(content)
         formatted_messages.append({"role": role, "content": content})
 
     formatted_messages.extend(
