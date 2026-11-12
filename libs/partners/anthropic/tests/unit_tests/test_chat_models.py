@@ -816,6 +816,61 @@ def test__merge_messages_tool_message_cache_control() -> None:
     assert expected == actual
 
 
+def test__merge_messages_orders_tool_results_before_other_blocks() -> None:
+    """Merged human/tool runs place `tool_result` blocks ahead of other blocks."""
+    messages = [
+        HumanMessage("Additional context"),
+        ToolMessage("Result", tool_call_id="call_1"),
+    ]
+    original = [copy.deepcopy(m) for m in messages]
+
+    actual = _merge_messages(messages)
+
+    assert actual == [
+        HumanMessage(
+            [
+                {
+                    "type": "tool_result",
+                    "content": "Result",
+                    "tool_use_id": "call_1",
+                    "is_error": False,
+                },
+                {"type": "text", "text": "Additional context"},
+            ]
+        )
+    ]
+    assert messages == original
+
+    # Interleaved tool and human messages preserve relative order within each group.
+    interleaved = [
+        ToolMessage("r1", tool_call_id="c1"),
+        HumanMessage("mid"),
+        ToolMessage("r2", tool_call_id="c2", status="error"),
+        HumanMessage("end"),
+    ]
+    actual_interleaved = _merge_messages(interleaved)
+    assert actual_interleaved == [
+        HumanMessage(
+            [
+                {
+                    "type": "tool_result",
+                    "content": "r1",
+                    "tool_use_id": "c1",
+                    "is_error": False,
+                },
+                {
+                    "type": "tool_result",
+                    "content": "r2",
+                    "tool_use_id": "c2",
+                    "is_error": True,
+                },
+                {"type": "text", "text": "mid"},
+                {"type": "text", "text": "end"},
+            ]
+        )
+    ]
+
+
 def test__format_image() -> None:
     url = "dummyimage.com/600x400/000/fff"
     with pytest.raises(ValueError):
@@ -1223,6 +1278,155 @@ def test__format_messages_normalizes_distinct_ids_independently() -> None:
         tool_uses[0]["id"],
         tool_uses[1]["id"],
     }
+
+
+def test__format_messages_orders_tool_results_before_intervening_human_text() -> None:
+    """Intervening human text before a `ToolMessage` must follow `tool_result`."""
+    assistant = AIMessage(
+        content="",
+        tool_calls=[{"name": "lookup", "args": {"query": "example"}, "id": "call_1"}],
+    )
+    messages = [
+        HumanMessage("Question"),
+        assistant,
+        HumanMessage("Additional context"),
+        ToolMessage("Result", tool_call_id="call_1"),
+    ]
+
+    _, formatted = _format_messages(messages, model=MODEL_NAME)
+
+    assert formatted[-1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "content": "Result",
+                "tool_use_id": "call_1",
+                "is_error": False,
+            },
+            {"type": "text", "text": "Additional context"},
+        ],
+    }
+
+
+def test__format_messages_orders_mixed_tool_results_preserving_metadata() -> None:
+    """Reordering preserves relative order, metadata, and handles unmerged blocks."""
+    bad_id = "functions.lookup:0"
+    assistant = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "lookup", "args": {"query": "a"}, "id": bad_id},
+            {"name": "lookup", "args": {"query": "b"}, "id": "call_2"},
+        ],
+    )
+    messages = [
+        HumanMessage("Question"),
+        assistant,
+        HumanMessage(
+            [
+                {
+                    "type": "text",
+                    "text": "First note",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGk=",
+                    },
+                },
+            ]
+        ),
+        ToolMessage(
+            [
+                {
+                    "type": "text",
+                    "text": "First out",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tool_call_id=bad_id,
+            status="error",
+        ),
+        HumanMessage("Second note"),
+        ToolMessage(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_2",
+                    "content": "Second out",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tool_call_id="call_2",
+        ),
+    ]
+    original = copy.deepcopy(messages)
+
+    _, formatted = _format_messages(messages, model=MODEL_NAME)
+
+    assert [block["type"] for block in formatted[-1]["content"]] == [
+        "tool_result",
+        "tool_result",
+        "text",
+        "image",
+        "text",
+    ]
+    assert formatted[-1]["content"][0] == {
+        "type": "tool_result",
+        "content": [{"type": "text", "text": "First out"}],
+        "tool_use_id": _normalize_tool_call_id(bad_id),
+        "is_error": True,
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert formatted[-1]["content"][1] == {
+        "type": "tool_result",
+        "tool_use_id": "call_2",
+        "content": "Second out",
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert formatted[-1]["content"][2] == {
+        "type": "text",
+        "text": "First note",
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert formatted[-1]["content"][4] == {"type": "text", "text": "Second note"}
+    assert messages == original
+
+    # Single unmerged HumanMessage with mixed blocks also puts tool_result first.
+    unmerged = [
+        HumanMessage("Question"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "lookup", "args": {"query": "a"}, "id": "call_2"}],
+        ),
+        HumanMessage(
+            [
+                {"type": "text", "text": "Context"},
+                {"type": "tool_result", "tool_use_id": "call_2", "content": "Done"},
+            ]
+        ),
+    ]
+    _, unmerged_formatted = _format_messages(unmerged, model=MODEL_NAME)
+    assert [b["type"] for b in unmerged_formatted[-1]["content"]] == [
+        "tool_result",
+        "text",
+    ]
+
+    # Whitespace-only intervening human text is dropped cleanly.
+    whitespace = [
+        HumanMessage("Question"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "lookup", "args": {"query": "a"}, "id": "call_2"}],
+        ),
+        HumanMessage("   "),
+        ToolMessage("Done", tool_call_id="call_2"),
+    ]
+    _, ws_formatted = _format_messages(whitespace, model=MODEL_NAME)
+    assert [b["type"] for b in ws_formatted[-1]["content"]] == ["tool_result"]
 
 
 def test__format_tool_use_block() -> None:
@@ -3840,6 +4044,41 @@ def test_cache_control_absent_kwarg_bedrock_is_noop() -> None:
         if isinstance(content, list):
             for block in content:
                 assert "cache_control" not in block
+
+
+def test_bedrock_like_intervening_human_message_before_tool_result() -> None:
+    """Bedrock-like subclasses place `tool_result` first before caching tail."""
+    llm = _BedrockLikeAnthropic(model=MODEL_NAME)
+    assistant = AIMessage(
+        content="",
+        tool_calls=[{"name": "lookup", "args": {"query": "example"}, "id": "call_1"}],
+    )
+    messages = [
+        HumanMessage("Question"),
+        assistant,
+        HumanMessage("Additional context"),
+        ToolMessage("Result", tool_call_id="call_1"),
+    ]
+
+    payload = llm._get_request_payload(messages, cache_control={"type": "ephemeral"})
+
+    assert "cache_control" not in payload
+    assert payload["messages"][-1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "content": "Result",
+                "tool_use_id": "call_1",
+                "is_error": False,
+            },
+            {
+                "type": "text",
+                "text": "Additional context",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+    }
 
 
 def test_cache_control_kwarg_unknown_subclass_injects_into_blocks() -> None:
